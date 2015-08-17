@@ -1,0 +1,939 @@
+#!/usr/bin/env python
+
+# TODO:
+#  - review logging
+#  - transition strength [easy/force-hint]
+#  - support reasons properly
+#  - check psql support
+#  - block stength ["block-udeb"]
+#  - safer exports (rm old users, mkdir?)
+#  - review
+
+from contextlib import contextmanager
+import argparse
+import datetime
+import operator
+import re
+import sqlalchemy
+import sqlalchemy.ext.declarative
+from sqlalchemy.sql import select, func
+import sys
+import os
+import pprint
+import subprocess
+
+import brithint_schema
+from brithint_util import (merge_gens, queryresult, print_query,
+                           query_to_dict, query_to_dict_tup,
+                           print_history, Tuples)
+
+class MaltSession(object):
+    def __init__(self, malt):
+        self._event = None
+        self.malt = malt
+
+    @property
+    def event(self):
+        if self.readonly:
+            raise Exception("Cannot get event id for readonly session")
+        if self._event is None:
+            events = self.malt.meta.tables["events"]
+            q = events.insert().values(timestamp=datetime.datetime.now(),
+                                       reason=self.reason, user=self.user)
+            if self.malt.engine.name == 'sqlite':
+                self.conn.execute(q)
+                ev_id = self.conn.scalar(
+                     select([func.last_insert_rowid()]))
+            else:
+                q = q.returning(events.c.event_id)
+                ev_id = self.conn.scalar(q)
+            self._event = ev_id
+        return self._event
+
+class Malt(object):
+    def __init__(self, dbpath, **dbargs):
+        self.dbpath = dbpath
+        self.engine = sqlalchemy.create_engine(dbpath, **dbargs)
+
+        self.meta = sqlalchemy.MetaData(bind=self.engine)
+
+        self.meta.reflect() # bind=self.engine)
+        insp = sqlalchemy.inspect(self.engine)
+        for t in self.meta.tables:
+            for c in insp.get_unique_constraints(t):
+                self.meta.tables[t].append_constraint(
+                        sqlalchemy.UniqueConstraint(*c["column_names"],
+                            name=c.get("name", None)))
+
+        self.tables = {}
+        for t in self.meta.tables:
+            ins = TemporalTable.detect(self, self.meta.tables[t])
+            if ins is not None:
+                self.tables[t] = ins
+
+    @contextmanager
+    def session(self, readonly=False, reason=None, user=None):
+        sess = MaltSession(malt=self)
+        sess.conn = self.engine.connect() # create a new connection
+        sess.trans = sess.conn.begin()
+        sess.readonly = readonly
+        sess.reason = reason
+        if user is None:
+            user = os.getlogin()
+        sess.user = user
+        #if readonly and psql:
+        #    trans.execute("SET TRANSACTION READ ONLY")
+        # also, readonly should imply rollback instead of commit maybe
+        try:
+            yield sess
+            if not readonly:
+                sess.trans.commit()
+            else:
+                sess.trans.rollback() # shouldn't matter
+        except:
+            sess.trans.rollback()
+            raise
+
+class TemporalTable(object):
+    def __init__(self, env, table):
+        self.events = env.meta.tables["events"]
+        self.table = table
+
+    def __repr__(self):
+        return "<%s:%s>" % (self.__class__.__name__, self.table.name)
+
+    @classmethod
+    def detect(cls, env, table):
+        for col in ["ev_create", "ev_delete", "active"]:
+            if col not in table.columns:
+                return None
+
+        uniques = set()
+
+        for c in table.constraints:
+            if type(c) not in [sqlalchemy.sql.schema.PrimaryKeyConstraint,
+                           sqlalchemy.sql.schema.UniqueConstraint]:
+                continue
+
+            if "active" in c.columns or "ev_create" in c.columns:
+                cons = frozenset(x.name for x in c.columns)
+                uniques.add(cons - {"active", "ev_create", "ev_delete"})
+                continue
+            elif "ev_delete" in c.columns:
+                continue
+            else:
+                return None
+
+        if frozenset() in uniques or uniques == ():
+            return None
+
+        r = cls(env, table)
+        r._keys = frozenset.union(*uniques)
+        r._uniques = uniques
+        return r
+
+    def history(self, env, since=None, until=None, by=None, table=None, **kwargs):
+        if table is not None:
+            if not isinstance(table, list):
+                table = [table]
+            if self.table.name not in table:
+                return None
+
+        kwargs = dict((k,v) for k,v in kwargs.items() if v is not None)
+
+        t = self.table
+        t2 = t.alias()
+        ev = self.events
+
+        where = []
+        if since is not None:
+            where.append( ev.c.timestamp >= since )
+        if until is not None:
+            where.append( ev.c.timestamp < until )
+        if by is not None:
+            where.append( ev.c.user == by )
+
+        if kwargs:
+            w = reduce(operator.and_,
+                    [t.c[k] == v for k,v in kwargs.items()])
+            w2 = reduce(operator.and_,
+                    [t2.c[k] == v for k,v in kwargs.items()])
+            where.append( w | w2 )
+
+        cols_p  = [col for col in t.c if col.primary_key
+                      and col.name not in ["ev_create", "ev_delete", "active"]]
+
+        cols_v  = [col for col in t.c if not col.primary_key
+                      and col.name not in ["ev_create", "ev_delete", "active"]]
+
+        cols_vo = [col.label("orig_"+col.name) for col in cols_v]
+        cols_v2 = [t2.c[col.name].label("orig_"+col.name) for col in cols_v]
+
+        litcol = sqlalchemy.sql.expression.literal_column
+        case = sqlalchemy.sql.expression.case
+
+        col_cm = [case([(t2.c.package == None, 'c')], else_='m').label("cdm")]
+        col_d = [litcol("'d'").label("cdm")]
+
+        cols_v0 = col_d + [None]*len(cols_v)
+        cols_v = col_cm + cols_v
+
+        pkey_match = reduce(operator.and_, [c == t2.c[c.name] for c in cols_p])
+
+        cols_g = [ev, t.c.active]
+
+        qc = select(cols_g + cols_p + cols_v + cols_v2).select_from(t
+                .outerjoin(t2, (t.c.ev_create == t2.c.ev_delete) & pkey_match)
+                .join(ev, t.c.ev_create == ev.c.event_id))
+
+        # qc + qd = full outer join
+        qd = select(cols_g + cols_p + cols_v0 + cols_vo).select_from(t
+                .outerjoin(t2, (t.c.ev_delete == t2.c.ev_create) & pkey_match)
+                .join(ev, t.c.ev_delete == ev.c.event_id))
+        qd = qd.where(t2.c.ev_create == None)
+
+        if where:
+            qc = qc.where(reduce(operator.and_, where))
+            qd = qd.where(reduce(operator.and_, where))
+
+        q = qc.union_all(qd).order_by(ev.c.event_id, *cols_p)
+        return queryresult(env.conn.execute(q))
+
+    def query(self, env, at=None, **kwargs):
+        cols = set(c.name for c in self.table.columns)
+        if not (set(kwargs.keys()) <= cols):
+            raise Exception("Valid query parameters: %s" % (", ".join(sorted(cols))))
+
+        ev = self.events
+        t = self.table
+        c = t.c
+
+        ev_create = ev.alias(name="create")
+        ev_delete = ev.alias(name="delete")
+
+        cols = []
+        cols += [col.label("create_"+col.name) for col in ev_create.c]
+        cols += [col.label("delete_"+col.name) for col in ev_delete.c]
+        cols += [col for col in c if col.name not in ["ev_create", "ev_delete"]]
+
+        q = select(cols).select_from(t
+                           .join(ev_create, t.c.ev_create == ev_create.c.event_id)
+                      .outerjoin(ev_delete, t.c.ev_delete == ev_delete.c.event_id))
+
+        if at is None:
+            q = q.where(c.active)
+        else:
+            q = q.where(ev_create.c.timestamp <= at)
+            q = q.where((c.ev_delete == None) | (ev_delete.c.timestamp > at))
+
+        for k,v in kwargs.items():
+            if isinstance(v, list):
+                q = q.where(self.table.c[k].in_(v))
+            else:
+                q = q.where(self.table.c[k] == v)
+
+        r = env.conn.execute(q)
+        return queryresult(r)
+
+    def update(self, env, check_first=True, **kwargs):
+        cols = set(c.name for c in self.table.columns)
+        cols = cols - {"ev_create", "ev_delete", "active"}
+        if set(kwargs.keys()) != cols:
+            raise Exception("Invalid/incomplete parameters for update: %s" % (
+                ", ".join(sorted(cols))))
+
+        c = self.table.c
+
+        if check_first:
+            # see if there's already an active row matching kwargs
+            # if so, do nothing
+            w = [c[k] == kwargs[k] for k in kwargs]
+            q = select([c.ev_create]).where(reduce(operator.and_, w))
+            r = env.conn.scalar(q.where(c.active))
+            if r is not None:
+                return {"result": "noop"}
+
+        wheres = []
+        for u in self._uniques:
+            w = [c[k] == kwargs[k] for k in u]
+            wheres.append(reduce(operator.and_, w))
+
+        if wheres:
+            wheres = reduce(operator.or_, wheres)
+            q = self.table.update().values(ev_delete=env.event, active=None)
+            q = q.where(c.active).where(wheres)
+            env.conn.execute(q)
+
+        kwargs.update(ev_create=env.event, ev_delete=None, active=True)
+        q = self.table.insert(values=kwargs)
+        env.conn.execute(q)
+        return {"result": "ok"}
+
+    def remove(self, env, **kwargs):
+        cols = set(c.name for c in self.table.columns)
+        cols = cols - {"ev_create", "ev_delete", "active"}
+        if set(kwargs.keys()) <= cols:
+            pass
+        else:
+            raise Exception("Valid parameters for remove: %s" % (", ".join(sorted(cols))))
+
+        c = self.table.c
+
+        where = c["ev_delete"] == None
+        for k in kwargs:
+            where = where & (c[k] == kwargs[k])
+
+        q = self.table.select().where(where)
+        r = env.conn.execute(q).first()
+        if r is None:
+            return {"result": "noop"}
+
+        q = self.table.update().values(ev_delete=env.event, active=None)
+        q = q.where(where)
+        env.conn.execute(q)
+
+        return {"result": "ok"}
+
+class GroupTable(object):
+    def __init__(self, basetable, group):
+        self.base = basetable
+        self.group = group
+
+    def query_group(self, env, at=None, **kwargs):
+        base = self.base
+        cols = set(c.name for c in base.table.columns)
+        if not (set(kwargs.keys()) <= cols):
+            raise Exception("Valid query parameters: %s" % (", ".join(sorted(cols))))
+
+        ev = base.events
+        t = base.table
+        c = t.c
+
+        ev_create = ev.alias(name="create")
+        ev_delete = ev.alias(name="delete")
+
+        cols = []
+        cols += [col.label("create_"+col.name) for col in ev_create.c]
+        cols += [col.label("delete_"+col.name) for col in ev_delete.c]
+        cols += [col for col in c if col.name not in ["ev_create", "ev_delete"]]
+
+        q = select().select_from(t
+                           .join(ev_create, t.c.ev_create == ev_create.c.event_id)
+                      .outerjoin(ev_delete, t.c.ev_delete == ev_delete.c.event_id))
+        if at is None:
+            q = q.where(c.active)
+        else:
+            q = q.where(ev_create.c.timestamp <= at)
+            q = q.where((c.ev_delete == None) | (ev_delete.c.timestamp > at))
+
+        q_sub = q.column(c[self.group])
+        for k,v in kwargs.items():
+            if isinstance(v, list):
+                q_sub = q_sub.where(c[k].in_(v))
+            else:
+                q_sub = q_sub.where(c[k] == v)
+        q = q.where(c[self.group].in_(q_sub))
+
+        for col in cols:
+            q = q.column(col)
+
+        q = q.order_by(c[self.group])
+
+        r = env.conn.execute(q)
+        keys = tuple(r.keys())
+        groups = {}
+        g_idx = keys.index(self.group)
+        for row in r.fetchall():
+            r = tuple(row)
+            g = r[g_idx]
+            if g not in groups:
+                groups[g] = []
+            groups[g].append(r)
+        for g in groups:
+            groups[g] = Tuples(keys=keys, rows=groups[g])
+        return groups
+
+class MaltCmd(object):
+    _subcmds = None
+
+    @classmethod
+    def subcommand(cls, arg, help=None):
+        def dec(f):
+            if cls._subcmds is None:
+                cls._subcmds = []
+            cls._subcmds.append( (arg, help, f) )
+            return f
+        return dec
+
+    def __init__(self, args=sys.argv):
+        p = self.parser = argparse.ArgumentParser(
+                description="Britney Hint Tool")
+
+        p.add_argument("--debug", action="store_true", dest="debug", default=False,
+                       help='output debugging info')
+        dburl = p.add_mutually_exclusive_group()
+        dburl.add_argument("--db", type=str, help='address of database to use')
+        #dburl.add_argument("--url", type=str, help='url of malt server')
+
+        self.subparsers = p.add_subparsers()
+        for (arg, hlp, cmd) in self._subcmds:
+            p = self.subparsers.add_parser(arg, help=hlp)
+            g = cmd(self, p)
+            g.next() # set arguments
+            p.set_defaults(func=g.next)
+
+        self.cmd = self.parser.parse_args(args[1:])
+        if self.cmd.db is None:
+            print("Error: must specify --db")
+            sys.exit(1)
+
+    def run(self):
+        self.malt = Malt(self.cmd.db, echo=self.cmd.debug)
+        cmdres = self.cmd.func()
+        return cmdres
+
+@MaltCmd.subcommand("create-tables", "create brithint tables")
+def cmd_create_tables(maltcmd, p):
+    yield
+    meta = maltcmd.malt.meta
+    brithint_schema.make_tables(meta)
+    meta.create_all(maltcmd.malt.engine)
+    yield 0
+
+@MaltCmd.subcommand("list-tables", "list brithint tables")
+def cmd_list_tables(maltcmd, p):
+    yield
+    for t in sorted(maltcmd.malt.tables):
+        print " - %s" % (t,)
+    yield 0
+
+@MaltCmd.subcommand("history", "List history")
+def cmd_history(maltcmd, p):
+    hist_msg = {
+      "block": {
+          "c": "Package %(package)s blocked from propogation",
+          "d": "Package %(package)s unblocked from propogation",
+          "m": "Package %(package)s block modified",
+          },
+      "approve": {
+          "c": "Upload %(package)s/%(version)s approved for propogation",
+          "d": "Upload %(package)s/%(version)s unapproved for propogation",
+          "m": "Upload %(package)s/%(version)s approval modified",
+          },
+      "exempt": {
+          "c": "Upload %(package)s/%(version)s exempted from normal candidacy checks",
+          "d": "Upload %(package)s/%(version)s candidacy exemption removed",
+          "m": "Upload %(package)s/%(version)s exemption modified",
+          },
+      "remove": {
+          "c": "Upload %(package)s/%(version)s marked for removal",
+          "d": "Upload %(package)s/%(version)s unmarked for removal",
+          "m": "Upload %(package)s/%(version)s removal modified",
+          },
+      "transition": {
+          "c": "Upload %(package)s/%(version)s added to transition %(trans_id)s",
+          "d": "Upload %(package)s/%(orig_version)s removed from transition %(trans_id)s",
+          "m": "Package %(package)s in transition %(trans_id)s modified",
+          },
+    }
+
+    p.add_argument("--since", help="date/time to start looking at history")
+    p.add_argument("--until", help="date/time to finish looking at history")
+    p.add_argument("--by", help="only review changes by this user")
+    #p.add_argument("--table", help="only look at history on this table")
+    p.add_argument("--package", help="package to review")
+    yield
+
+    cmd = maltcmd.cmd
+    hist_info = {}
+    with maltcmd.malt.session(readonly=True) as sess:
+        for t in hist_msg.keys():
+            tbl = maltcmd.malt.tables[t]
+            r = tbl.history(sess, since=cmd.since, until=cmd.until, by=cmd.by,
+                package=cmd.package)
+            hist_info[t] = r
+
+    print_history(hist_info, hist_msg)
+    yield 0
+
+def _cmd_tbl_iter(maltcmd, tblop, items, selector, responses):
+    with maltcmd.malt.session() as sess:
+        for itm in items:
+            r = tblop(sess, **(selector(itm)))
+            if r["result"] in responses:
+                print "%s: %s" % (itm, responses[r["result"]])
+            else:
+                print "%s: problem -- %s" % (itm, r["result"])
+
+def _cmd_tbl_list(maltcmd, tblname, sel, *fmt):
+    cmd = maltcmd.cmd
+    tbl = maltcmd.malt.tables[tblname]
+
+    with maltcmd.malt.session(readonly=True) as sess:
+        qsel = dict(sel)
+        for k in list(qsel):
+            if qsel[k] is None or qsel[k] == []:
+                del qsel[k]
+        r = tbl.query(sess, **qsel)
+    print_query(r, *fmt)
+
+#####
+
+@MaltCmd.subcommand("remove-list", "List packages marked for removal")
+def cmd_exempt_list(maltcmd, p):
+    p.add_argument("packages", nargs='*', help="packages to list")
+    yield
+
+    _cmd_tbl_list(maltcmd, "remove",
+                  dict(package=maltcmd.cmd.packages),
+                  "package:35", "version:15")
+    yield 0
+
+@MaltCmd.subcommand("remove", "Mark upload(s) for removal")
+def cmd_exempt_add(maltcmd, p):
+    p.add_argument("uploads", nargs='+', help="uploads to mark for removal (pkg/ver)")
+    yield
+
+    def sel(upl):
+        p,v = upl.split("/", 1)
+        return dict(package=p, version=v)
+
+    _cmd_tbl_iter(maltcmd, maltcmd.malt.tables["remove"].update,
+                  maltcmd.cmd.uploads, sel,
+                  {"ok": "marked for removal",
+                   "noop": "already marked for removal"})
+    yield 0
+
+@MaltCmd.subcommand("remove-remove", 
+                    "Unmark uploads(s) for removal")
+def cmd_exempt_remove(maltcmd, p):
+    p.add_argument("uploads", nargs='+', help="uploads to unmark")
+    yield
+
+    def sel(arg):
+        pkg, ver = arg.split("/", 1)
+        return dict(package=pkg, version=ver)
+
+    _cmd_tbl_iter(maltcmd, maltcmd.malt.tables["remove"].remove,
+                  maltcmd.cmd.uploads, sel,
+                  {"ok": "unmarked for removal",
+                   "noop": "was not marked for removal"})
+    yield 0
+
+#####
+
+@MaltCmd.subcommand("exempt-list",
+        "List uploads explicitly exempted from candidacy checks")
+def cmd_exempt_list(maltcmd, p):
+    p.add_argument("packages", nargs='*', help="packages to list")
+    yield
+
+    _cmd_tbl_list(maltcmd, "exempt",
+                  dict(package=maltcmd.cmd.packages),
+                  "package:35", "version:15")
+    yield 0
+
+@MaltCmd.subcommand("exempt", "Exempty upload(s) from candidacy checks")
+def cmd_exempt_add(maltcmd, p):
+    p.add_argument("uploads", nargs='+', help="uploads to exempt (pkg/ver)")
+    yield
+
+    def sel(upl):
+        p,v = upl.split("/", 1)
+        return dict(package=p, version=v)
+
+    _cmd_tbl_iter(maltcmd, maltcmd.malt.tables["exempt"].update,
+                  maltcmd.cmd.uploads, sel,
+                  {"ok": "exempted", "noop": "already exempted"})
+    yield 0
+
+@MaltCmd.subcommand("exempt-remove", 
+                    "Unexempt uploads(s) for candidacy checks")
+def cmd_exempt_remove(maltcmd, p):
+    p.add_argument("uploads", nargs='+', help="uploads to unexempt")
+    yield
+
+    def sel(arg):
+        pkg, ver = arg.split("/", 1)
+        return dict(package=pkg, version=ver)
+
+    _cmd_tbl_iter(maltcmd, maltcmd.malt.tables["exempt"].remove,
+                  maltcmd.cmd.uploads, sel,
+                  {"ok": "unexempted", "noop": "was not exempted"})
+    yield 0
+
+#####
+
+@MaltCmd.subcommand("approve-list",
+    "List uploads explicitly approved for propogation")
+def cmd_approve_list(maltcmd, p):
+    p.add_argument("packages", nargs='*', help="packages to list")
+    yield
+
+    _cmd_tbl_list(maltcmd, "approve",
+                  dict(package=maltcmd.cmd.packages),
+                  "package:35", "version:15")
+    yield 0
+
+@MaltCmd.subcommand("approve", "Approve upload(s) for propogation")
+def cmd_exempt_add(maltcmd, p):
+    p.add_argument("uploads", nargs='+', help="uploads to approve (pkg/ver)")
+    yield
+
+    def sel(upl):
+        p,v = upl.split("/", 1)
+        return dict(package=p, version=v)
+
+    _cmd_tbl_iter(maltcmd, maltcmd.malt.tables["approve"].update,
+                  maltcmd.cmd.uploads, sel,
+                  {"ok": "approved", "noop": "already approved"})
+    yield 0
+
+@MaltCmd.subcommand("approve-remove", "Unapprove uploads(s) for propogation")
+def cmd_approve_remove(maltcmd, p):
+
+    def sel(arg):
+        pkg, ver = arg.split("/", 1)
+        return dict(package=pkg, version=ver)
+
+    p.add_argument("uploads", nargs='+', help="uploads to unapprove")
+    yield
+
+    _cmd_tbl_iter(maltcmd, maltcmd.malt.tables["approve"].remove,
+                  maltcmd.cmd.uploads, sel,
+                  {"ok": "unapproved", "noop": "was not approved"})
+    yield 0
+
+#####
+
+@MaltCmd.subcommand("block-list",
+    "List packages blocked from automatic propogation")
+def cmd_block_list(maltcmd, p):
+    p.add_argument("packages", nargs='*', help="packages to list")
+    yield
+
+    _cmd_tbl_list(maltcmd, "block",
+                  dict(package=maltcmd.cmd.packages),
+                  "package:50")
+    yield 0
+
+@MaltCmd.subcommand("block", "Block upload(s) from automatic propogation")
+def cmd_block_add(maltcmd, p):
+    p.add_argument("packages", nargs='+', help="packages to block")
+    yield
+
+    def sel(pkg):
+        return dict(package=pkg)
+
+    _cmd_tbl_iter(maltcmd, maltcmd.malt.tables["block"].update,
+                  maltcmd.cmd.packages, sel,
+                  {"ok": "blocked", "noop": "already blocked"})
+    yield 0
+
+@MaltCmd.subcommand("block-remove",
+                    "Unblock package(s) from automatic propogation")
+def cmd_block_remove(maltcmd, p):
+    p.add_argument("packages", nargs='+', help="packages to block")
+    yield
+
+    def sel(pkg):
+        return dict(package=pkg)
+
+    _cmd_tbl_iter(maltcmd, maltcmd.malt.tables["block"].remove,
+                  maltcmd.cmd.packages, sel,
+                  {"ok": "unblocked", "noop": "was not blocked"})
+    yield 0
+
+@MaltCmd.subcommand("transition-list",
+    "List transitions")
+def cmd_transition_list(maltcmd, p):
+    p.add_argument("packages", nargs='*', help="packages to list")
+    yield
+
+    cmd = maltcmd.cmd
+    tbl = maltcmd.malt.tables["transition"]
+    gtbl = GroupTable(tbl, "trans_id")
+
+    with maltcmd.malt.session(readonly=True) as sess:
+        qsel = dict(package=maltcmd.cmd.packages)
+        for k in list(qsel):
+            if qsel[k] is None or qsel[k] == []:
+                del qsel[k]
+        r = gtbl.query_group(sess, **qsel)
+    for g in r:
+        print "[%s]: %s" % (g,
+                " ".join("%(package)s/%(version)s" % (u) for u in r[g]))
+
+    yield 0
+
+@MaltCmd.subcommand("transition", "Add upload(s) to transition")
+def cmd_transition(maltcmd, p):
+    p.add_argument("--set", help="set transition to be exactly these packages")
+    p.add_argument("--easy", help="mark this transition as easy")
+    p.add_argument("--force", help="mark this transition as forceful")
+    p.add_argument("transition", help="transition id")
+    p.add_argument("uploads", nargs='+', help="uploads to add to transition")
+    yield
+
+    def sel(upl):
+        p,v = upl.split("/", 1)
+        return dict(trans_id=maltcmd.cmd.transition, package=p, version=v)
+
+    _cmd_tbl_iter(maltcmd, maltcmd.malt.tables["transition"].update,
+                  maltcmd.cmd.uploads, sel,
+                  {"ok": "added to transition",
+                   "noop": "already in transition"})
+    yield 0
+
+@MaltCmd.subcommand("transition-remove",
+                    "Remove upload(s) from transition")
+def cmd_transition_remove(maltcmd, p):
+    p.add_argument("transition", help="transition id")
+    p.add_argument("uploads", nargs='+', help="uploads to remove from transition")
+    yield
+
+    def sel(upl):
+        p,v = upl.split("/", 1)
+        return dict(trans_id=maltcmd.cmd.transition, package=p, version=v)
+
+    _cmd_tbl_iter(maltcmd, maltcmd.malt.tables["transition"].remove,
+                  maltcmd.cmd.uploads, sel,
+                  {"ok": "removed from transition",
+                   "noop": "was not in transition"})
+    yield 0
+
+def dehuman_date(d):
+    if d is None:
+        return d
+    if re.match("^\d+$", d):
+        d = int(d)
+    else:
+        d = int(subprocess.check_output(["date", "+%s", "-d", d]))
+    return datetime.datetime.fromtimestamp(d)
+
+@MaltCmd.subcommand("export", "Export to hints dir")
+def cmd_export(maltcmd, p):
+    p.add_argument("--at", default=None, help="timestamp of db state")
+    p.add_argument("hintsdir", help="path to hints directory")
+    yield
+
+    cmd = maltcmd.cmd
+    at = dehuman_date(cmd.at)
+    with maltcmd.malt.session(readonly=True) as sess:
+        blocked = query_to_dict(maltcmd.malt.tables["block"].query(sess, at=at),
+                                by="package")
+        approved = query_to_dict_tup(maltcmd.malt.tables["approve"].query(sess, at=at),
+                                by=("package","version"))
+        exempted = query_to_dict_tup(maltcmd.malt.tables["exempt"].query(sess, at=at),
+                                by=("package","version"))
+        removed = query_to_dict_tup(maltcmd.malt.tables["remove"].query(sess, at=at),
+                                by=("package","version"))
+        transitions = query_to_dict_tup(maltcmd.malt.tables["transition"].query(sess, at=at), by=("trans_id", "package"))
+
+    userfiles = {}
+    def output(user, line):
+        if user not in userfiles:
+            f = open(os.path.join(cmd.hintsdir, user), "w")
+            userfiles[user] = f
+        else:
+            f = userfiles[user]
+        f.write(line + "\n")
+
+    for p,details in blocked.iteritems():
+        u = details["create_user"]
+        if details["create_reason"]:
+            output(u, "# %s:" % (details["create_reason"]))
+        output(u, "block %s" % (p,))
+
+    def do_op_pkg_ver(op, entries):
+        for (p, v), details in entries.iteritems():
+            u = details["create_user"]
+            if details["create_reason"]:
+                output(u, "# %s:" % (details["create_reason"]))
+            output(u, "%s %s/%s" % (op, p, v))
+
+    do_op_pkg_ver("unblock", approved)
+    do_op_pkg_ver("force",   exempted)
+    do_op_pkg_ver("remove",  removed)
+
+    d = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for u in userfiles:
+        output(u, "\n### generated by brithint, %s" % (d,))
+        userfiles[u].close()
+
+    yield 0
+
+@MaltCmd.subcommand("import", "Import settings from hints dir")
+def cmd_import(maltcmd, p):
+    p.add_argument("hintsdir", help="path to hints directory")
+    p.add_argument("--valid-users", help="valid users")
+    yield
+
+    cmd = maltcmd.cmd
+    if cmd.valid_users:
+        valid = [x.strip() for x in cmd.valid_users.split(",")]
+    else:
+        valid = [x for x in os.listdir(cmd.hintsdir)
+                   if x.lower() == x and x[0] not in "#."]
+
+    h = {"block": [],
+         "unblock": [],
+         "force": [],
+         "remove": [],
+         "hint": [],
+         "force-hint": [],
+         "easy": [],
+        }
+    onearg_hints = ["block", "block-udeb", "unblock", "unblock-udeb",
+                    "force", "remove"]
+    for user in valid:
+        p = os.path.join(cmd.hintsdir, user)
+        if not os.path.exists(p): continue
+
+        f = open(p, "r")
+        for l in f.readlines():
+            l = l.strip()
+            if not l or l[0] == '#': continue
+            l = l.split()
+            hint, args = l[0], l[1:]
+
+            if hint == "finished":
+                break
+
+            if hint == "approve":
+                hint = "unblock"
+
+            if hint == "urgent":
+                hint = "age-days"
+                args = ["0"] + args
+
+            if hint not in h:
+                h[hint] = []
+            if hint in onearg_hints:
+                for a in args:
+                    if hint == "block" and "/" in a: continue
+                    if hint != "block" and "/" not in a: continue
+                    h[hint].append( (user,a) )
+            elif hint == "age-days":
+                t = args[0]
+                for a in args[1:]:
+                    h[hint].append( (user,a,t) )
+            else:
+                h[hint].append( (user,) + tuple(args) )
+
+    with maltcmd.malt.session(readonly=True) as sess:
+        blocked = query_to_dict(maltcmd.malt.tables["block"].query(sess),
+                                by="package")
+        approved = query_to_dict_tup(maltcmd.malt.tables["approve"].query(sess),
+                                by=("package","version"))
+        exempted = query_to_dict_tup(maltcmd.malt.tables["exempt"].query(sess),
+                                by=("package","version"))
+        removed = query_to_dict_tup(maltcmd.malt.tables["remove"].query(sess),
+                                by=("package","version"))
+        transitions = query_to_dict_tup(maltcmd.malt.tables["transition"].query(sess), by=("trans_id", "package"))
+
+    seen_trans = {}
+    for tr_ty in ["hint", "easy", "force-hint"]:
+        for t in h[tr_ty]:
+            n = t[1].split("/")[0]
+            while n in seen_trans:
+                n = n+"~"
+            seen_trans[n] = (tr_ty,) + t
+    want_trans = []
+    for t in seen_trans:
+        for u in seen_trans[t][2:]:
+            want_trans.append( (seen_trans[t][0], seen_trans[t][1], t, u) )
+
+    def diff(a, b):
+        a_ = set(iter(a))
+        b_ = set(iter(b))
+        return (a_ - b_, b_ - a_)
+
+    block, unblock = diff(
+            (x[1] for x in h["block"]),
+            blocked.keys())
+    approve, unapprove = diff(
+            (x[1] for x in h["unblock"]),
+            ("%s/%s"%(p,v) for p,v in approved.keys()))
+    exempt, unexempt = diff(
+            (x[1] for x in h["force"]),
+            ("%s/%s"%(p,v) for p,v in exempted.keys()))
+    remove, unremove = diff(
+            (x[1] for x in h["remove"]),
+            ("%s/%s"%(p,v) for p,v in removed.keys()))
+    trans, untrans = diff(
+            ((t,p) for (w,y,t,p) in want_trans),
+            ((t,"%s/%s"%(p,info["version"])) for (t,p),info in transitions.items()))
+
+    for user, pkg in h["block"]:
+        if pkg not in block: continue
+        with maltcmd.malt.session(user=user) as sess:
+            maltcmd.malt.tables["block"].update(sess, package=pkg)
+            print "block %s by %s" % (pkg, user)
+    for pkg in unblock:
+        user = blocked[pkg]["create_user"]
+        with maltcmd.malt.session(user=user) as sess:
+            maltcmd.malt.tables["block"].remove(sess, package=pkg)
+            print "unblock %s by %s" % (pkg, user)
+
+    for user, upl in h["unblock"]:
+        if upl not in approve: continue
+        pkg, ver = upl.split("/",1)
+        with maltcmd.malt.session(user=user) as sess:
+            maltcmd.malt.tables["approve"].update(sess, package=pkg, version=ver)
+            print "approve %s/%s by %s" % (pkg, ver, user)
+    for upl in unapprove:
+        pkg, ver = upl.split("/",1)
+        user = approved[pkg,ver]["create_user"]
+        with maltcmd.malt.session(user=user) as sess:
+            maltcmd.malt.tables["approve"].remove(sess, package=pkg, version=ver)
+            print "unapprove %s/%s by %s" % (pkg, ver, user)
+
+    for user, upl in h["force"]:
+        if upl not in exempt: continue
+        pkg, ver = upl.split("/",1)
+        with maltcmd.malt.session(user=user) as sess:
+            maltcmd.malt.tables["exempt"].update(sess, package=pkg, version=ver)
+            print "exempt %s/%s by %s" % (pkg, ver, user)
+    for upl in unexempt:
+        pkg, ver = upl.split("/",1)
+        user = exempted[pkg,ver]["create_user"]
+        with maltcmd.malt.session(user=user) as sess:
+            maltcmd.malt.tables["exempt"].remove(sess, package=pkg, version=ver)
+            print "unexempt %s/%s by %s" % (pkg, ver, user)
+
+    for user, upl in h["remove"]:
+        if upl not in remove: continue
+        pkg, ver = upl.split("/",1)
+        with maltcmd.malt.session(user=user) as sess:
+            maltcmd.malt.tables["remove"].update(sess, package=pkg, version=ver)
+            print "remove %s/%s by %s" % (pkg, ver, user)
+    for upl in unremove:
+        pkg, ver = upl.split("/",1)
+        user = removed[pkg,ver]["create_user"]
+        with maltcmd.malt.session(user=user) as sess:
+            maltcmd.malt.tables["remove"].remove(sess, package=pkg, version=ver)
+            print "unremove %s/%s by %s" % (pkg, ver, user)
+
+    for strength, user, trans_id, upl in want_trans:
+        if (trans_id, upl) not in trans: continue
+        pkg, ver = upl.split("/",1)
+        with maltcmd.malt.session(user=user) as sess:
+            maltcmd.malt.tables["transition"].update(sess, trans_id=trans_id,
+                    package=pkg, version=ver)
+            print "trans %s %s/%s by %s" % (trans_id, pkg, ver, user)
+    for trans_id, upl in untrans:
+        pkg, ver = upl.split("/",1)
+        user = transitions[trans_id,pkg]["create_user"]
+        with maltcmd.malt.session(user=user) as sess:
+            maltcmd.malt.tables["transition"].remove(sess, trans_id=trans_id, package=pkg, version=ver)
+            print "untrans %s/%s by %s" % (pkg, ver, user)
+
+    yield 0
+
+def main(args=["brithint"]):
+    return MaltCmd(args).run()
+
+if __name__ == "__main__":
+    rc = main(sys.argv)
+    sys.exit(rc)
